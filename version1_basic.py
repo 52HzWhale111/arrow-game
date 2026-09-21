@@ -4,8 +4,14 @@
 ================================================
 一款点击式箭头解谜小游戏，使用 Python + Pygame 开发。
 
-当前进度：先把画面搭起来——紫色背景、白色棋盘、按方向绘制的箭头。
-（点击、路径检测、失误次数等玩法下一步再做。）
+规则：
+    棋盘上每个格子最多有一个箭头（上/下/左/右四种方向）。
+    点击箭头后，程序检查它前进方向上、到棋盘边界之间还有没有别的箭头：
+        · 没有阻挡 -> 箭头飞出去并消失
+        · 有阻挡   -> 箭头不能消失，会抖动变红并弹出提示
+
+当前进度：点击、路径检测和飞出动画已经能跑了，
+失误次数、通关 / 失败判定下一步再做。
 
 运行： python version1_basic.py
 """
@@ -263,15 +269,38 @@ class Arrow:
         self.dir = direction
         self.alive = True
         self.spawn = 0.0          # 入场动画进度
+        self.shake = 0.0          # 碰撞抖动剩余时间
+        self.flash = 0.0          # 碰撞变红剩余时间
 
     @property
     def vec(self):
         return DIR_VEC[self.dir]
 
 
+class Flying:
+    """一个正在飞出棋盘的箭头（纯表现层，不影响逻辑）。"""
+
+    def __init__(self, x, y, direction, cell):
+        self.x, self.y = float(x), float(y)
+        self.dir = direction
+        self.cell = cell
+        self.t = 0.0
+        self.trail = []
+
+
+class Toast:
+    """屏幕上飘一下就消失的小提示文字。"""
+
+    def __init__(self, text, pos, color, size=22, life=0.9):
+        self.text, self.pos, self.color, self.size = text, pos, color, size
+        self.t, self.life = 0.0, life
+
+
 class Game:
     def __init__(self):
         self.arrows = []
+        self.flies = []
+        self.toasts = []
         self.gate = 0.0               # 入场动画的总时长
         self.running = True
         self.buttons = []             # 每帧重建的可点击区域
@@ -285,6 +314,8 @@ class Game:
         grid = GRID
         self.grid_w, self.grid_h = len(grid[0]), len(grid)
         self.arrows = []
+        self.flies.clear()
+        self.toasts.clear()
         order = 0
         for y, row in enumerate(grid):
             for x, ch in enumerate(row):
@@ -305,6 +336,45 @@ class Game:
                 return a
         return None
 
+    def blocked_by(self, arrow):
+        """路径检测：从箭头所在格出发，沿它的方向一步一步走到棋盘边界，
+        路上只要遇到另一个还活着的箭头，就是被挡住了。"""
+        dx, dy = arrow.vec
+        cx, cy = arrow.x + dx, arrow.y + dy
+        while 0 <= cx < self.grid_w and 0 <= cy < self.grid_h:
+            other = self.arrow_at(cx, cy)
+            if other is not None:
+                return other
+            cx += dx
+            cy += dy
+        return None          # 一路走到边界都没东西 -> 可以飞出去
+
+    # ---------------- 交互 ----------------
+    def click(self, pos):
+        if not BOARD_AREA.collidepoint(pos):
+            return
+        gx = int((pos[0] - self.board_rect.x) // self.cell)
+        gy = int((pos[1] - self.board_rect.y) // self.cell)
+        if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
+            a = self.arrow_at(gx, gy)
+            if a is not None and a.spawn >= 0:     # spawn<0 表示还没轮到它出场
+                self.try_fly(a)
+
+    def try_fly(self, arrow):
+        """点到一个箭头：先判断能不能飞，再分别处理。"""
+        blocker = self.blocked_by(arrow)
+        if blocker is not None:
+            # ---- 被挡住：抖动 + 变红 + 文字提示 ----
+            arrow.shake = 0.45
+            arrow.flash = 0.7
+            tx, ty = self.cell_center(arrow.x, arrow.y, -0.55)
+            ty = max(ty, BOARD_AREA.y + 26)        # 别让提示飘到画面外面去
+            self.toasts.append(Toast("被挡住了！", (tx, ty), C_RED, 20))
+            return
+        # ---- 没有阻挡：立刻从棋盘逻辑上移除，然后播放飞出动画 ----
+        arrow.alive = False
+        self.flies.append(Flying(arrow.x, arrow.y, arrow.dir, self.cell))
+
     def cell_center(self, gx, gy, dy_cells=0.0):
         return (int(self.board_rect.x + (gx + 0.5) * self.cell),
                 int(self.board_rect.y + (gy + 0.5 + dy_cells) * self.cell))
@@ -322,6 +392,21 @@ class Game:
                 a.spawn = min(0.0, a.spawn + dt)
             elif a.spawn < 1.0:
                 a.spawn = min(1.0, a.spawn + dt * 3.2)
+            if a.shake > 0:
+                a.shake = max(0.0, a.shake - dt)
+            if a.flash > 0:
+                a.flash = max(0.0, a.flash - dt)
+        for f in self.flies:
+            f.t += dt
+            f.trail.append((f.x, f.y, 1.0))
+            f.trail = [(tx, ty, ta - dt * 4.5) for tx, ty, ta in f.trail if ta - dt * 4.5 > 0]
+            speed = 6 + 26 * (f.t ** 1.7)          # 起步慢、越来越快
+            f.x += DIR_VEC[f.dir][0] * speed * dt
+            f.y += DIR_VEC[f.dir][1] * speed * dt
+        self.flies = [f for f in self.flies if f.t < 0.55]
+        for t in self.toasts:
+            t.t += dt
+        self.toasts = [t for t in self.toasts if t.t < t.life]
 
     # ---------------- 绘制 ----------------
     def background(self, surf):
@@ -361,10 +446,18 @@ class Game:
             if a.spawn < 0:
                 continue
             self.draw_arrow(surf, a)
+        # 正在飞出的箭头（带拖尾）
+        for f in self.flies:
+            self.draw_flying(surf, f)
 
     def draw_arrow(self, surf, a):
         c = self.cell
-        sp = get_arrow_sprite(c, a.dir, C_INK)
+        color = C_INK
+        if a.flash > 0:
+            # 碰撞后闪红：在深藏青和玫红之间来回
+            k = abs(math.sin(a.flash * 22))
+            color = tuple(int(C_INK[i] + (C_RED[i] - C_INK[i]) * k) for i in range(3))
+        sp = get_arrow_sprite(c, a.dir, color)
         cx, cy = self.cell_center(a.x, a.y)
         # 入场：从小到大弹出来
         k = max(0.0, min(1.0, a.spawn))
@@ -373,7 +466,30 @@ class Game:
             scale = 0.55 + 0.45 * e + 0.12 * math.sin(e * math.pi)
             size = max(2, int(c * scale))
             sp = pygame.transform.smoothscale(sp, (size, size))
+        # 碰撞：垂直于自身方向来回抖动
+        if a.shake > 0:
+            off = math.sin(a.shake * 42) * 10 * (a.shake / 0.45)
+            dx, dy = DIR_VEC[a.dir]
+            cx += int(-dy * off)
+            cy += int(dx * off)
         surf.blit(sp, sp.get_rect(center=(cx, cy)))
+
+    def draw_flying(self, surf, f):
+        c = self.cell
+        base = self.board_rect.x + (f.x + 0.5) * c, self.board_rect.y + (f.y + 0.5) * c
+        sp = get_arrow_sprite(c, f.dir, C_INK)
+        # 拖尾：几个逐渐变淡的残影
+        for i, (tx, ty, ta) in enumerate(f.trail):
+            if i % 2:
+                continue
+            g = sp.copy()
+            g.fill((255, 255, 255, int(70 * ta)), None, pygame.BLEND_RGBA_MULT)
+            surf.blit(g, g.get_rect(center=(self.board_rect.x + (tx + 0.5) * c,
+                                            self.board_rect.y + (ty + 0.5) * c)))
+        ghost = sp.copy()
+        ghost.fill((255, 255, 255, max(0, int(255 * (1 - f.t / 0.55)))), None,
+                   pygame.BLEND_RGBA_MULT)
+        surf.blit(ghost, ghost.get_rect(center=base))
 
     # ---- 底部操作栏 ----
     def draw_bottombar(self, surf):
@@ -395,6 +511,13 @@ class Game:
         self.background(surf)
         self.draw_board(surf)
         self.draw_bottombar(surf)
+        # 飘字提示
+        for t in self.toasts:
+            k = t.t / t.life
+            s = render_text(t.text, t.size, t.color, bold=True, outline=C_WHITE, outline_w=2)
+            s = s.copy()
+            s.fill((255, 255, 255, int(255 * (1 - k))), None, pygame.BLEND_RGBA_MULT)
+            surf.blit(s, s.get_rect(center=(t.pos[0], t.pos[1] - 26 * k)))
 
 
 # ============================================================================
@@ -418,10 +541,12 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     game.running = False
                 elif event.key == pygame.K_r:
-                    game.load_level()          # 还没做玩法，先只重播一遍入场动画
+                    game.load_level()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if game.btn("restart").collidepoint(event.pos):
                     game.load_level()
+                else:
+                    game.click(event.pos)
         game.update(dt)
         game.draw(screen)
         pygame.display.flip()

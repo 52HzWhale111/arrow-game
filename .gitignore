@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时生成的本地存档（每个人玩出来的进度不一样，不需要提交）
+save.json
+
+# 打包中间产物（自动生成、体积大，不进仓库）
+build/
+dist/
+*.spec
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

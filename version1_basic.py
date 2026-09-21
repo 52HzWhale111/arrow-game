@@ -8,15 +8,14 @@
     棋盘上每个格子最多有一个箭头（上/下/左/右四种方向）。
     点击箭头后，程序检查它前进方向上、到棋盘边界之间还有没有别的箭头：
         · 没有阻挡 -> 箭头飞出去并消失
-        · 有阻挡   -> 箭头不能消失，会抖动变红并弹出提示
-
-当前进度：点击、路径检测和飞出动画已经能跑了，
-失误次数、通关 / 失败判定下一步再做。
+        · 有阻挡   -> 箭头不能消失，会抖动变红并弹出提示，同时扣掉一次失误机会
+    失误次数（爱心）耗尽则本关失败；清空全部箭头则通关。
 
 运行： python version1_basic.py
 """
 
 import math
+import random
 import sys
 
 import pygame
@@ -149,10 +148,66 @@ def draw_panel(surf, rect, color, radius, border=None, border_w=3, shadow=True):
     draw_round_rect(surf, rect, color, radius)
 
 
+def draw_heart(surf, center, size, color, outline=None):
+    """用爱心参数方程画一颗饱满的心（比两个圆加三角形好看）。"""
+    cx, cy = center
+    pts = []
+    for i in range(40):
+        t = 2 * math.pi * i / 40
+        x = 16 * math.sin(t) ** 3
+        y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        pts.append((cx + x * size / 32.0, cy - y * size / 32.0))
+    pygame.draw.polygon(surf, color, pts)
+    if outline:
+        pygame.draw.polygon(surf, outline, pts, 2)
+
+
+def draw_star(surf, center, size, color, points=5):
+    cx, cy = center
+    pts = []
+    for i in range(points * 2):
+        r = size if i % 2 == 0 else size * 0.45
+        a = -math.pi / 2 + i * math.pi / points
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    pygame.draw.polygon(surf, color, pts)
+
+
+def draw_chevron_left(surf, center, size, color, width=4):
+    cx, cy = center
+    pygame.draw.lines(surf, color, False,
+                      [(cx + size * 0.4, cy - size * 0.7),
+                       (cx - size * 0.4, cy),
+                       (cx + size * 0.4, cy + size * 0.7)], width)
+
+
+def render_gradient_text(text, size, top_color, bottom_color, bold=True,
+                         outline=None, outline_w=3, shadow=None, shadow_off=(0, 4)):
+    """渐变填充 + 描边 + 投影的标题字（参考图里那种糖果立体字）。
+
+    关键点：渐变只能染在"字身"上，不能染到描边和投影上，
+    所以先把描边+投影合成一层，再用"白字蒙版 × 竖直渐变"合成字身层，最后叠起来。
+    """
+    layer = render_text(text, size, C_WHITE, bold=bold, outline=outline,
+                        outline_w=outline_w, shadow=shadow, shadow_off=shadow_off)
+    mask = get_font(size, bold).render(text, True, C_WHITE)
+    grad = vgradient(mask.get_size(), top_color, bottom_color)
+    mask = mask.copy()
+    mask.blit(grad, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    pad = outline_w + abs(shadow_off[0]) + 2 if outline else 2
+    pad_y = outline_w + abs(shadow_off[1]) + 2 if outline else 2
+    out = layer.copy()
+    out.blit(mask, (pad, pad_y))
+    return out
+
+
 def draw_icon(surf, kind, center, r, color):
     """按钮里的小图标，统一以 center 为中心、r 为半径来画。"""
     cx, cy = center
-    if kind == "loop":
+    if kind == "play":
+        pygame.draw.polygon(surf, color, [(cx - r * 0.55, cy - r * 0.8),
+                                          (cx - r * 0.55, cy + r * 0.8),
+                                          (cx + r * 0.75, cy)])
+    elif kind == "loop":
         pygame.draw.arc(surf, color, pygame.Rect(cx - r, cy - r, 2 * r, 2 * r), 0.7, 5.5, 3)
         pygame.draw.polygon(surf, color, [(cx + r * 0.95, cy - r * 0.95),
                                           (cx + r * 1.15, cy - r * 0.05),
@@ -246,15 +301,40 @@ def get_arrow_sprite(cell, direction, color, fade=0.55):
 # ============================================================================
 # 四、关卡数据
 # ============================================================================
-# 每关用一个字符串列表表示，U/D/L/R 表示箭头方向，"." 表示空格。
+# 每个关卡用一个字符串列表表示，U/D/L/R 表示箭头方向，"." 表示空格。
 # 这些关卡由 tools/gen_levels.py 用"逆推构造法"生成，
-# 生成时就已经保证了必定存在通关顺序。
+# 生成时就已经保证了必定存在通关顺序，并逐关用程序验证过。
 
-GRID = [
-    ".R.D",
-    "RU..",
-    "...L",
+LEVELS = [
+    {
+        "name": "第 1 关",
+        "grid": [
+            ".R.D",
+            "RU..",
+            "...L",
+        ],
+    },
+    {
+        "name": "第 2 关",
+        "grid": [
+            ".R..U",
+            "L..L.",
+            ".UR.U",
+            "....U",
+        ],
+    },
+    {
+        "name": "第 3 关",
+        "grid": [
+            "LRR.U.",
+            "DL...L",
+            "DL.L..",
+            "......",
+        ],
+    },
 ]
+
+MAX_LIVES = 3
 
 
 # ============================================================================
@@ -298,24 +378,35 @@ class Toast:
 
 class Game:
     def __init__(self):
+        self.scene = "menu"           # menu / play / win / lose
+        self.level_index = 0
+        self.level = None
         self.arrows = []
         self.flies = []
         self.toasts = []
+        self.lives = MAX_LIVES
+        self.time_used = 0.0
         self.gate = 0.0               # 入场动画的总时长
         self.running = True
         self.buttons = []             # 每帧重建的可点击区域
         self.board_rect = pygame.Rect(0, 0, 0, 0)
         self.cell = 80
         self._bg = None
+        self._menu_bg = None
+        self._top_grad = None
         self._bottom_grad = None
 
     # ---------------- 关卡 ----------------
-    def load_level(self):
-        grid = GRID
+    def load_level(self, index):
+        self.level_index = index % len(LEVELS)
+        data = LEVELS[self.level_index]
+        grid = data["grid"]
         self.grid_w, self.grid_h = len(grid[0]), len(grid)
         self.arrows = []
         self.flies.clear()
         self.toasts.clear()
+        self.lives = MAX_LIVES
+        self.time_used = 0.0
         order = 0
         for y, row in enumerate(grid):
             for x, ch in enumerate(row):
@@ -325,6 +416,10 @@ class Game:
                     self.arrows.append(a)
                     order += 1
         self.gate = order * 0.035 + 0.45
+        self.scene = "play"
+
+    def restart(self):
+        self.load_level(self.level_index)
 
     @property
     def remain(self):
@@ -351,29 +446,62 @@ class Game:
 
     # ---------------- 交互 ----------------
     def click(self, pos):
-        if not BOARD_AREA.collidepoint(pos):
+        if self.scene == "menu":
+            if self.btn("start").collidepoint(pos):
+                self.load_level(0)
             return
-        gx = int((pos[0] - self.board_rect.x) // self.cell)
-        gy = int((pos[1] - self.board_rect.y) // self.cell)
-        if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
-            a = self.arrow_at(gx, gy)
-            if a is not None and a.spawn >= 0:     # spawn<0 表示还没轮到它出场
-                self.try_fly(a)
+        # 顶部左上角的返回按钮在任何界面都有效
+        if self.btn("home").collidepoint(pos):
+            self.scene = "menu"
+            return
+        if self.scene == "play":
+            if self.btn("restart").collidepoint(pos):
+                self.restart()
+                return
+            if not BOARD_AREA.collidepoint(pos):
+                return
+            gx = int((pos[0] - self.board_rect.x) // self.cell)
+            gy = int((pos[1] - self.board_rect.y) // self.cell)
+            if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
+                a = self.arrow_at(gx, gy)
+                if a is not None and a.spawn >= 0:     # spawn<0 表示还没轮到它出场
+                    self.try_fly(a)
+            return
+        if self.scene == "win":
+            if self.btn("next").collidepoint(pos):
+                if self.level_index + 1 < len(LEVELS):
+                    self.load_level(self.level_index + 1)
+                else:
+                    self.scene = "menu"
+            elif self.btn("back").collidepoint(pos):
+                self.scene = "menu"
+            return
+        if self.scene == "lose":
+            if self.btn("retry").collidepoint(pos):
+                self.restart()
+            elif self.btn("back").collidepoint(pos):
+                self.scene = "menu"
 
     def try_fly(self, arrow):
         """点到一个箭头：先判断能不能飞，再分别处理。"""
         blocker = self.blocked_by(arrow)
         if blocker is not None:
-            # ---- 被挡住：抖动 + 变红 + 文字提示 ----
+            # ---- 被挡住：抖动 + 变红 + 文字提示 + 扣一次失误 ----
             arrow.shake = 0.45
             arrow.flash = 0.7
+            self.lives -= 1
             tx, ty = self.cell_center(arrow.x, arrow.y, -0.55)
             ty = max(ty, BOARD_AREA.y + 26)        # 别让提示飘到画面外面去
             self.toasts.append(Toast("被挡住了！", (tx, ty), C_RED, 20))
+            if self.lives <= 0:
+                self.lives = 0
+                self.scene = "lose"
             return
         # ---- 没有阻挡：立刻从棋盘逻辑上移除，然后播放飞出动画 ----
         arrow.alive = False
         self.flies.append(Flying(arrow.x, arrow.y, arrow.dir, self.cell))
+        if self.remain == 0:
+            self.scene = "win"
 
     def cell_center(self, gx, gy, dy_cells=0.0):
         return (int(self.board_rect.x + (gx + 0.5) * self.cell),
@@ -387,6 +515,8 @@ class Game:
 
     # ---------------- 更新 ----------------
     def update(self, dt):
+        if self.scene == "play":
+            self.time_used += dt
         for a in self.arrows:
             if a.spawn < 0:
                 a.spawn = min(0.0, a.spawn + dt)
@@ -413,6 +543,110 @@ class Game:
         if self._bg is None:
             self._bg = vgradient((WIN_W, WIN_H), C_BG_TOP, C_BG_BOT)
         surf.blit(self._bg, (0, 0))
+
+    def menu_background(self, surf):
+        """开始界面：紫色底 + 淡淡的箭头/星星/云朵图案（模仿参考图的背景装饰）。"""
+        if self._menu_bg is None:
+            bg = vgradient((WIN_W, WIN_H), (150, 144, 240), (116, 110, 218))
+            rng = random.Random(2026)
+            deco = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            for _ in range(26):
+                x, y = rng.randint(0, WIN_W), rng.randint(0, WIN_H)
+                kind = rng.choice(["star", "star", "cloud", "arrow", "bolt"])
+                if kind == "star":
+                    draw_star(deco, (x, y), rng.randint(8, 18), C_BG_PATTERN + (150,))
+                elif kind == "cloud":
+                    for k in range(3):
+                        pygame.draw.circle(deco, C_BG_PATTERN + (110,),
+                                           (x + k * 14 - 14, y + (k % 2) * 4 - 2), 13)
+                elif kind == "arrow":
+                    s = pygame.transform.rotate(get_arrow_sprite(54, "R", C_BG_PATTERN, 0.8),
+                                                rng.choice([0, 90, 180, 270, 45, 135]))
+                    s.set_alpha(60)
+                    deco.blit(s, (x, y))
+                else:
+                    pygame.draw.polygon(deco, C_BG_PATTERN + (120,),
+                                        [(x, y), (x - 9, y + 18), (x + 2, y + 16),
+                                         (x - 3, y + 32), (x + 11, y + 11), (x - 1, y + 13)])
+            bg.blit(deco, (0, 0))
+            self._menu_bg = bg
+        surf.blit(self._menu_bg, (0, 0))
+
+    # ---- 开始界面 ----
+    def draw_menu(self, surf):
+        self.menu_background(surf)
+        cx = WIN_W // 2
+
+        # 标题：渐变填充 + 蓝色描边 + 深色投影（模仿参考图的立体字）
+        title = render_gradient_text("一箭又一箭", 62, (255, 248, 214), (255, 172, 54),
+                                     outline=C_BLUE, outline_w=5,
+                                     shadow=(60, 70, 150), shadow_off=(0, 6))
+        surf.blit(title, title.get_rect(center=(cx, 250)))
+
+        # 两支橙色小箭头穿过标题（呼应参考图的 logo）
+        a1 = pygame.transform.rotate(get_arrow_sprite(64, "R", C_ORANGE, 0.85), -32)
+        surf.blit(a1, a1.get_rect(center=(cx + 132, 208)))
+        a2 = pygame.transform.rotate(get_arrow_sprite(56, "R", C_ORANGE, 0.85), 150)
+        surf.blit(a2, a2.get_rect(center=(cx - 142, 300)))
+
+        draw_text(surf, "点击箭头，让它们按顺序飞出去", 20, (238, 236, 255),
+                  center=(cx, 352))
+
+        # 开始游戏按钮
+        r = pygame.Rect(0, 0, 260, 74)
+        r.center = (cx, 470)
+        draw_button(surf, r, C_GREEN, "开始游戏", size=30, icon="play",
+                    edge=C_GREEN_DARK, border=C_WHITE)
+
+        label = pygame.Rect(0, 0, 140, 40)
+        label.center = (cx, r.bottom + 34)
+        draw_panel(surf, label, C_WHITE, 12, shadow=False)
+        draw_text(surf, LEVELS[0]["name"], 22, C_INK, center=label.center, bold=True)
+        self.buttons = [("start", r)]
+
+        draw_text(surf, "共 %d 关 · 每关 %d 次机会" % (len(LEVELS), MAX_LIVES), 18,
+                  (226, 224, 252), center=(cx, WIN_H - 70))
+        draw_text(surf, "Python + Pygame 课程作业", 16, (206, 202, 244),
+                  center=(cx, WIN_H - 44))
+
+    # ---- 顶部信息栏 ----
+    def draw_topbar(self, surf):
+        if self._top_grad is None:                 # 渐变条只算一次，之后每帧直接贴
+            self._top_grad = vgradient((WIN_W, TOP_H + 20), (150, 144, 240), (132, 126, 230))
+        surf.blit(self._top_grad, (0, 0))
+        cx = WIN_W // 2
+
+        draw_text(surf, LEVELS[self.level_index]["name"], 34, C_WHITE,
+                  center=(cx, 30), bold=True, shadow=(74, 68, 150), shadow_off=(0, 3))
+        # 爱心 = 剩余失误次数
+        for i in range(MAX_LIVES):
+            alive = i < self.lives
+            draw_heart(surf, (cx - 44 + i * 44, 74), 17,
+                       C_RED if alive else C_RED_DARK,
+                       outline=(198, 46, 70) if alive else None)
+        # 计时
+        m, s = divmod(int(self.time_used), 60)
+        pygame.draw.circle(surf, (238, 238, 250), (cx - 34, 106), 9, 2)
+        pygame.draw.line(surf, (238, 238, 250), (cx - 34, 106), (cx - 34, 100), 2)
+        pygame.draw.line(surf, (238, 238, 250), (cx - 34, 106), (cx - 29, 106), 2)
+        draw_text(surf, "%dm%02ds" % (m, s), 21, (245, 245, 255),
+                  center=(cx + 12, 106), bold=True)
+
+        # 左上角：返回主菜单
+        back = pygame.Rect(18, 22, 46, 46)
+        pygame.draw.circle(surf, (255, 255, 255), back.center, 23)
+        draw_chevron_left(surf, back.center, 12, C_INK, 4)
+
+        # 右上角：剩余箭头数
+        badge = pygame.Rect(WIN_W - 106, 22, 88, 46)
+        draw_panel(surf, badge, C_WHITE, 23, shadow=False)
+        mini = get_arrow_sprite(30, "R", C_INK, 0.7)
+        surf.blit(mini, mini.get_rect(center=(badge.x + 26, badge.centery)))
+        draw_text(surf, str(self.remain), 26, C_INK, center=(badge.x + 60, badge.centery),
+                  bold=True)
+        draw_text(surf, "剩余箭头", 14, (232, 230, 252), center=(badge.centerx, badge.bottom + 14))
+
+        self.buttons.append(("home", back))
 
     # ---- 棋盘 ----
     def draw_board(self, surf):
@@ -506,10 +740,39 @@ class Game:
         draw_text(surf, "点击箭头，前方没有阻挡就能飞出去", 16, (222, 220, 250),
                   center=(WIN_W // 2, y + 118))
 
+    # ---- 通关 / 失败浮层 ----
+    def draw_overlay(self, surf, title, title_color, subtitle, buttons, accent):
+        scrim = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        scrim.fill((40, 34, 90, 150))
+        surf.blit(scrim, (0, 0))
+
+        card = pygame.Rect(0, 0, 340, 306)
+        card.center = (WIN_W // 2, WIN_H // 2 - 20)
+        draw_panel(surf, card, C_WHITE, 30)
+        pill = pygame.Rect(0, 0, 96, 9)
+        pill.center = (card.centerx, card.y + 26)
+        draw_round_rect(surf, pill, accent, 5)
+        draw_text(surf, title, 44, title_color, center=(card.centerx, card.y + 80), bold=True,
+                  shadow=(210, 210, 225), shadow_off=(0, 3))
+        draw_text(surf, subtitle, 20, C_INK_SOFT, center=(card.centerx, card.y + 130))
+
+        rects = []
+        for i, (label, name, color, text_color) in enumerate(buttons):
+            r = pygame.Rect(0, 0, 230, 56)
+            r.center = (card.centerx, card.y + 182 + i * 68)
+            draw_button(surf, r, color, label, text_color=text_color, size=24,
+                        border=C_WHITE if color != C_WHITE else (225, 227, 238))
+            rects.append((name, r))
+        return rects
+
     def draw(self, surf):
         self.buttons = []
+        if self.scene == "menu":
+            self.draw_menu(surf)
+            return
         self.background(surf)
         self.draw_board(surf)
+        self.draw_topbar(surf)
         self.draw_bottombar(surf)
         # 飘字提示
         for t in self.toasts:
@@ -518,6 +781,20 @@ class Game:
             s = s.copy()
             s.fill((255, 255, 255, int(255 * (1 - k))), None, pygame.BLEND_RGBA_MULT)
             surf.blit(s, s.get_rect(center=(t.pos[0], t.pos[1] - 26 * k)))
+        if self.scene == "win":
+            last = self.level_index == len(LEVELS) - 1
+            m, s = divmod(int(self.time_used), 60)
+            sub = "用时 %dm%02ds，剩余 %d 次机会" % (m, s, self.lives)
+            btns = [("下一关" if not last else "返回主菜单", "next", C_GREEN, C_WHITE),
+                    ("返回主菜单", "back", C_WHITE, C_INK)] if not last else \
+                   [("返回主菜单", "back", C_GREEN, C_WHITE)]
+            self.buttons += self.draw_overlay(
+                surf, "通关！" if not last else "全部通关！", (255, 168, 40), sub, btns, C_YELLOW)
+        elif self.scene == "lose":
+            self.buttons += self.draw_overlay(
+                surf, "挑战失败", C_RED, "失误次数用完了，再试一次吧",
+                [("重新开始", "retry", C_GREEN, C_WHITE), ("返回主菜单", "back", C_WHITE, C_INK)],
+                C_RED)
 
 
 # ============================================================================
@@ -530,7 +807,6 @@ def main():
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     clock = pygame.time.Clock()
     game = Game()
-    game.load_level()
 
     while game.running:
         dt = clock.tick(FPS) / 1000.0
@@ -539,14 +815,24 @@ def main():
                 game.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    game.running = False
-                elif event.key == pygame.K_r:
-                    game.load_level()
+                    if game.scene == "play":
+                        game.scene = "menu"
+                    else:
+                        game.running = False
+                elif event.key == pygame.K_r and game.scene == "play":
+                    game.restart()
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    if game.scene == "win":
+                        if game.level_index + 1 < len(LEVELS):
+                            game.load_level(game.level_index + 1)
+                        else:
+                            game.scene = "menu"
+                    elif game.scene == "lose":
+                        game.restart()
+                    elif game.scene == "menu":
+                        game.load_level(0)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if game.btn("restart").collidepoint(event.pos):
-                    game.load_level()
-                else:
-                    game.click(event.pos)
+                game.click(event.pos)
         game.update(dt)
         game.draw(screen)
         pygame.display.flip()
